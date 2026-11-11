@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Drone Monitor</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#111111">
+<style>
+  body { font-family: sans-serif; margin: 0; padding: 12px; background: #111; color: #eee; }
+  h3 { margin: 16px 0 6px; }
+  #status { text-align: center; font-size: 26px; font-weight: bold; padding: 16px; border-radius: 8px; background: #666; }
+  .safe { background: #1e8c3c !important; } .warn { background: #e68200 !important; } .danger { background: #d32020 !important; }
+  .row { display: flex; gap: 8px; margin: 6px 0; }
+  .card { flex: 1; background: #222; padding: 10px; border-radius: 8px; text-align: center; }
+  .card b { display: block; font-size: 24px; }
+  label { display: block; margin-top: 8px; font-size: 13px; color: #aaa; }
+  input { width: 100%; box-sizing: border-box; padding: 8px; font-size: 16px; border-radius: 6px; border: 0; }
+  button { flex: 1; padding: 12px; font-size: 16px; border: 0; border-radius: 6px; background: #2d6cdf; color: #fff; }
+  #cam { width: 100%; background: #000; min-height: 180px; border-radius: 8px; margin-top: 8px; }
+  #msg, #btState { font-size: 13px; color: #aaa; margin-top: 4px; }
+</style>
+</head>
+<body>
+
+<div id="status">NO DATA</div>
+<div class="row">
+  <div class="card">Gas<b id="gas">--</b></div>
+  <div class="card">Distance<b id="dist">-- cm</b></div>
+</div>
+
+<h3>Sensors (Bluetooth)</h3>
+<div class="row">
+  <button onclick="connectBt()">Connect Bluetooth</button>
+  <button onclick="disconnectBt()">Disconnect</button>
+</div>
+<div id="btState">Bluetooth: not connected</div>
+
+<h3>Camera (Wi-Fi)</h3>
+<label>ESP32-CAM IP</label><input id="camIp" placeholder="192.168.4.1">
+<div class="row">
+  <button onclick="startStream()">Live stream</button>
+  <button onclick="stopStream()">Stop</button>
+  <button onclick="takePhoto()">Take photo</button>
+</div>
+<img id="cam" alt="camera">
+
+<h3>Hazard settings</h3>
+<label>Gas WARNING at or above (0-4095)</label><input id="gasWarn" type="number">
+<label>Gas DANGER at or above (0-4095)</label><input id="gasDanger" type="number">
+<label>Distance WARNING at or below (cm)</label><input id="distWarn" type="number">
+<label>Distance DANGER at or below (cm)</label><input id="distDanger" type="number">
+<div class="row" style="margin-top:12px"><button onclick="save()">Save settings</button></div>
+<div id="msg"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const defaults = { camIp: "192.168.4.1", gasWarn: 1500, gasDanger: 2500, distWarn: 100, distDanger: 40 };
+const keys = Object.keys(defaults);
+keys.forEach(k => $(k).value = localStorage.getItem(k) ?? defaults[k]);
+function save() { keys.forEach(k => localStorage.setItem(k, $(k).value.trim())); say("Settings saved"); }
+function say(t) { $("msg").textContent = t; }
+const num = k => parseFloat($(k).value);
+
+// ---- Camera (Wi-Fi) ----
+function startStream() { save(); $("cam").src = `http://${$("camIp").value.trim()}:81/stream`; }
+function stopStream() { $("cam").src = ""; }
+async function takePhoto() {
+  try {
+    const blob = await (await fetch(`http://${$("camIp").value.trim()}/capture`)).blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "drone_" + new Date().toISOString().replace(/[:.]/g, "-") + ".jpg";
+    a.click();
+    say("Photo saved to Downloads");
+  } catch (e) { window.open(`http://${$("camIp").value.trim()}/capture`, "_blank"); say("Photo opened in a new tab: press and hold it to save"); }
+}
+
+// ---- Sensors (Bluetooth LE, Nordic UART service) ----
+const SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const TX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+let btDevice = null, buffer = "";
+
+async function connectBt() {
+  if (!navigator.bluetooth) { $("btState").textContent = "Use Chrome on Android (Safari/iPhone is not supported)"; return; }
+  try {
+    btDevice = await navigator.bluetooth.requestDevice({ filters: [{ services: [SERVICE] }] });
+    btDevice.addEventListener("gattserverdisconnected", () => {
+      $("btState").textContent = "Bluetooth: disconnected";
+      offline();
+    });
+    $("btState").textContent = "Connecting...";
+    const server = await btDevice.gatt.connect();
+    const ch = await (await server.getPrimaryService(SERVICE)).getCharacteristic(TX);
+    await ch.startNotifications();
+    ch.addEventListener("characteristicvaluechanged", e => {
+      buffer += new TextDecoder().decode(e.target.value);
+      let i;
+      while ((i = buffer.indexOf("\n")) >= 0) { handleLine(buffer.slice(0, i)); buffer = buffer.slice(i + 1); }
+    });
+    $("btState").textContent = "Bluetooth: connected to " + btDevice.name;
+  } catch (e) { $("btState").textContent = "Bluetooth failed: " + e.message; }
+}
+function disconnectBt() { if (btDevice && btDevice.gatt.connected) btDevice.gatt.disconnect(); }
+function offline() { $("status").className = ""; $("status").textContent = "SENSOR OFFLINE"; }
+
+let lastBeep = 0;
+function beep() {
+  if (Date.now() - lastBeep < 2000) return;
+  lastBeep = Date.now();
+  if (navigator.vibrate) navigator.vibrate(500);
+  try { const c = new AudioContext(), o = c.createOscillator(); o.frequency.value = 880; o.connect(c.destination); o.start(); o.stop(c.currentTime + 0.4); } catch (e) {}
+}
+
+function handleLine(line) {
+  const g = line.match(/gas:\s*(-?[\d.]+)/i), d = line.match(/dist:\s*(-?[\d.]+)/i);
+  if (!g || !d) return;
+  const gas = parseFloat(g[1]), dist = parseFloat(d[1]);
+  $("gas").textContent = gas;
+  $("dist").textContent = dist < 0 ? "none" : dist + " cm";
+
+  let level = 0, why = [];
+  if (gas >= num("gasDanger")) { level = 2; why.push("GAS"); }
+  else if (gas >= num("gasWarn")) { level = 1; why.push("gas"); }
+  if (dist >= 0) {
+    if (dist <= num("distDanger")) { level = 2; why.push("TOO CLOSE"); }
+    else if (dist <= num("distWarn")) { level = Math.max(level, 1); why.push("close"); }
+  }
+  const s = $("status");
+  s.className = ["safe", "warn", "danger"][level];
+  s.textContent = ["SAFE", "WARNING: ", "DANGER: "][level] + (level ? why.join(", ") : "");
+  if (level === 2) beep();
+}
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+</script>
+</body>
+</html>
